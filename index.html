@@ -11,12 +11,14 @@
   <meta name="format-detection" content="telephone=no" />
   <title>QuizRush English</title>
   <meta name="description" content="Quiz multiplayer de inglês com sala, cronômetro e ranking." />
-  <meta name="quizrush-version" content="scroll-fixed-1" />
+  <meta name="quizrush-version" content="audit-fixed-1" />
 
   <!-- PeerJS conecta os celulares diretamente ao computador que criou a sala. -->
-  <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+  <script defer src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"
+    onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js'"></script>
   <!-- QRCode.js cria o QR da sala no próprio navegador. -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+    onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js'"></script>
 
   <style>
     :root {
@@ -1531,7 +1533,7 @@
     </header>
 
     <div id="mobileCompatNote" class="mobile-compat-note">
-      📱 Android e iPhone compatíveis. Agora você pode arrastar a tela normalmente, inclusive sobre o minigame.
+      📱 Interface compatível com Android e iPhone. A sala usa conexão direta e pode exigir TURN em redes restritas.
     </div>
 
     <main>
@@ -1977,12 +1979,45 @@
     const QUESTION_TIME = 20;
     const ANSWER_SYMBOLS = ["▲", "◆", "●", "■"];
 
+    function safeStorageGet(storageName, key, fallback = null) {
+      try {
+        return window[storageName]?.getItem(key) ?? fallback;
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    function safeStorageSet(storageName, key, value) {
+      try {
+        window[storageName]?.setItem(key, String(value));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function createStableToken() {
+      try {
+        if (crypto?.randomUUID) return crypto.randomUUID();
+      } catch (_) {}
+      return `player-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    }
+
+    function getOrCreatePlayerToken() {
+      const stored = safeStorageGet("sessionStorage", "quizrush-player-token");
+      if (stored) return stored;
+      const token = createStableToken();
+      safeStorageSet("sessionStorage", "quizrush-player-token", token);
+      return token;
+    }
+
     const state = {
       mode: "home", // home | host | player | solo
       peer: null,
       hostConnection: null,
       roomCode: "",
       playerName: "",
+      playerToken: getOrCreatePlayerToken(),
       players: new Map(),
       currentQuestion: -1,
       score: 0,
@@ -1997,7 +2032,7 @@
       position: null,
       totalPlayers: 0,
       flappy: null,
-      flappyBest: Number(localStorage.getItem("quizrush-flappy-best") || 0),
+      flappyBest: Number(safeStorageGet("localStorage", "quizrush-flappy-best", "0") || 0),
       joinTimeoutId: null,
       joinConfirmed: false,
       joinAttempts: 0,
@@ -2007,6 +2042,7 @@
       reconnectTimerId: null,
       wakeLock: null,
       audioUnlocked: false,
+      audioContext: null,
       mobileHeartbeatId: null,
       timerId: null,
       timeLeft: QUESTION_TIME,
@@ -2058,17 +2094,32 @@
       return `quizrush-english-${code}`;
     }
 
+    // TURN pode ser injetado antes deste script com:
+    // window.QUIZRUSH_TURN_SERVERS = [{ urls, username, credential }];
+    // Sem TURN, algumas redes móveis/escolares não conseguem abrir WebRTC.
+    const OPTIONAL_TURN_SERVERS = Array.isArray(window.QUIZRUSH_TURN_SERVERS)
+      ? window.QUIZRUSH_TURN_SERVERS
+      : [];
+
     const PEER_OPTIONS = {
       debug: 1,
       config: {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
-          { urls: "stun:stun2.l.google.com:19302" }
+          { urls: "stun:stun2.l.google.com:19302" },
+          ...OPTIONAL_TURN_SERVERS
         ],
         iceCandidatePoolSize: 4
       }
     };
+
+    function connectionDiagnostic() {
+      const pc = state.hostConnection?.peerConnection;
+      const ice = pc?.iceConnectionState || "sem estado ICE";
+      const signal = pc?.signalingState || "sem sinalização";
+      return `ICE: ${ice}; sinalização: ${signal}; TURN: ${OPTIONAL_TURN_SERVERS.length ? "configurado" : "não configurado"}`;
+    }
 
     function getMobilePlatform() {
       const ua = navigator.userAgent || "";
@@ -2214,6 +2265,7 @@
     }
 
     function launchConfetti(amount = 75) {
+      if (getMobilePlatform().isMobile) amount = Math.min(amount, 45);
       const colors = ["#00e5ff", "#ff2fb3", "#ffe600", "#a855f7", "#22e56f", "#ff365d", "#ffffff"];
       for (let i = 0; i < amount; i++) {
         const piece = document.createElement("i");
@@ -2307,7 +2359,10 @@
       } catch (_) {}
 
       try {
-        state.players.forEach(player => player.conn?.close());
+        state.players.forEach(player => {
+          clearTimeout(player.disconnectTimer);
+          player.conn?.close();
+        });
       } catch (_) {}
 
       try {
@@ -2333,11 +2388,16 @@
       if (!state.soundEnabled) return;
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const ctx = new AudioCtx();
+        if (!AudioCtx) return;
+        if (!state.audioContext || state.audioContext.state === "closed") {
+          state.audioContext = new AudioCtx();
+        }
+        const ctx = state.audioContext;
+        if (ctx.state === "suspended") ctx.resume?.();
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.frequency.value = frequency;
-        gain.gain.setValueAtTime(0.05, ctx.currentTime);
+        gain.gain.setValueAtTime(0.04, ctx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
         osc.connect(gain);
         gain.connect(ctx.destination);
@@ -2475,17 +2535,74 @@
     }
 
     function handleIncomingPlayer(conn) {
+      conn.playerKey = null;
+
+      const sendJoined = (player) => {
+        try {
+          conn.send({
+            type: "joined",
+            name: player.name,
+            roomCode: state.roomCode,
+            playerToken: player.id
+          });
+        } catch (_) {}
+      };
+
+      const restoreCurrentRound = (player) => {
+        if (state.currentQuestion < 0) return;
+
+        if (state.answersReceived.has(player.id) || state.questionResolved) {
+          try {
+            conn.send({
+              type: "reconnectedWaiting",
+              score: player.score,
+              streak: player.streak,
+              skipsLeft: player.skipsLeft,
+              allInAvailable: player.allInAvailable
+            });
+          } catch (_) {}
+          return;
+        }
+
+        const question = QUESTIONS[state.currentQuestion];
+        if (!question) return;
+        try {
+          conn.send({
+            type: "question",
+            index: state.currentQuestion,
+            duration: Math.max(1, state.timeLeft),
+            skipsLeft: player.skipsLeft,
+            allInAvailable: player.allInAvailable,
+            bossRound: isBossRound(state.currentQuestion),
+            question: {
+              category: question.category,
+              question: question.question,
+              answers: question.answers
+            }
+          });
+        } catch (_) {}
+      };
+
       conn.on("data", data => {
         if (!data || typeof data.type !== "string") return;
 
         if (data.type === "join") {
-          const existingPlayer = state.players.get(conn.peer);
+          const token = typeof data.playerToken === "string" && data.playerToken.length >= 8
+            ? data.playerToken.slice(0, 100)
+            : `peer:${conn.peer}`;
+          conn.playerKey = token;
+
+          const existingPlayer = state.players.get(token);
           if (existingPlayer) {
+            clearTimeout(existingPlayer.disconnectTimer);
+            existingPlayer.disconnectTimer = null;
             existingPlayer.connected = true;
-            try {
-              conn.send({ type: "joined", name: existingPlayer.name, roomCode: state.roomCode });
-            } catch (_) {}
+            existingPlayer.conn = conn;
+            existingPlayer.peerId = conn.peer;
+            sendJoined(existingPlayer);
+            restoreCurrentRound(existingPlayer);
             renderHostPlayers();
+            updateHostQuestionStats();
             return;
           }
 
@@ -2509,8 +2626,9 @@
             return;
           }
 
-          state.players.set(conn.peer, {
-            id: conn.peer,
+          const player = {
+            id: token,
+            peerId: conn.peer,
             name: uniquePlayerName(cleanName),
             avatar: ["🦊","🐯","🐸","🐼","🦁","🐙","🦄","🐲","🦅","🐺"][state.players.size % 10],
             score: 0,
@@ -2518,40 +2636,46 @@
             skipsLeft: 3,
             allInAvailable: true,
             conn,
-            connected: true
-          });
-
-          const player = state.players.get(conn.peer);
-          conn.send({
-            type: "joined",
-            name: player.name,
-            roomCode: state.roomCode
-          });
-
+            connected: true,
+            disconnectTimer: null
+          };
+          state.players.set(token, player);
+          sendJoined(player);
           renderHostPlayers();
           broadcastLobby();
           playTone(700, .08);
+          return;
         }
 
-        if (data.type === "answer") {
-          receivePlayerAnswer(conn.peer, data);
-        }
+        const playerKey = conn.playerKey;
+        if (!playerKey) return;
 
-        if (data.type === "reaction") {
-          receiveReaction(conn.peer, data.emoji);
-        }
+        if (data.type === "answer") receivePlayerAnswer(playerKey, data);
+        if (data.type === "reaction") receiveReaction(playerKey, data.emoji);
         if (data.type === "ping") {
           try { conn.send({ type: "pong", at: data.at }); } catch (_) {}
         }
       });
 
       conn.on("close", () => {
-        const player = state.players.get(conn.peer);
-        if (player) {
-          player.connected = false;
-          if (state.currentQuestion < 0) state.players.delete(conn.peer);
-          renderHostPlayers();
-          updateHostQuestionStats();
+        const playerKey = conn.playerKey;
+        const player = playerKey ? state.players.get(playerKey) : null;
+        if (!player || player.conn !== conn) return; // uma conexão antiga não derruba a nova
+
+        player.connected = false;
+        renderHostPlayers();
+        updateHostQuestionStats();
+
+        if (state.currentQuestion < 0) {
+          clearTimeout(player.disconnectTimer);
+          player.disconnectTimer = setTimeout(() => {
+            const current = state.players.get(playerKey);
+            if (current && !current.connected) {
+              state.players.delete(playerKey);
+              renderHostPlayers();
+              broadcastLobby();
+            }
+          }, 20000);
         }
       });
 
@@ -2684,6 +2808,7 @@
           conn.send({
             type: "join",
             name,
+            playerToken: state.playerToken,
             attempt: state.joinHandshakeCount,
             sentAt: Date.now()
           });
@@ -2712,8 +2837,13 @@
       clearTimeout(state.joinTimeoutId);
       clearTimeout(state.reconnectTimerId);
       stopJoinHandshake();
+      try { state.hostConnection?.close(); } catch (_) {}
       setStatus("Falha ao entrar");
-      setWaitingConnectionState("Não conectou", message, { loading: false, retry: true });
+      setWaitingConnectionState(
+        "Não conectou",
+        `${message} (${connectionDiagnostic()})`,
+        { loading: false, retry: true }
+      );
     }
 
     function retryCurrentJoin() {
@@ -2910,24 +3040,44 @@
     }
 
     function scheduleMobileReconnect() {
-      if (state.mode !== "player" || !state.roomCode || !state.playerName) return;
+      if (state.mode !== "player" || !state.roomCode || !state.playerName || state.gameFinished) return;
       clearTimeout(state.reconnectTimerId);
+      state.joinConfirmed = false;
+      state.joinAttempts = 0;
+      setStatus("Reconectando...");
+
       state.reconnectTimerId = setTimeout(() => {
-        if (state.hostConnection?.open || state.gameFinished) return;
+        if (state.hostConnection?.open || state.gameFinished || state.mode !== "player") return;
+
         if (!state.peer || state.peer.destroyed) {
           state.peer = new Peer(undefined, PEER_OPTIONS);
           state.peer.on("open", () => {
-            state.joinAttempts = 0;
-            state.joinConfirmed = false;
+            armGlobalJoinTimeout();
             connectPlayerToHost();
           });
-          state.peer.on("error", error => console.warn("Erro ao reconectar Peer:", error));
-        } else {
-          state.joinAttempts = 0;
-          state.joinConfirmed = false;
-          connectPlayerToHost();
+          state.peer.on("error", error => {
+            console.warn("Erro ao recriar Peer:", error);
+            showJoinFailure("Não foi possível recriar a conexão do celular.");
+          });
+          return;
         }
-      }, 650);
+
+        if (state.peer.disconnected) {
+          try {
+            // O listener de open instalado na criação original inicia o novo canal.
+            state.peer.reconnect();
+          } catch (error) {
+            console.warn("Falha no Peer.reconnect:", error);
+            try { state.peer.destroy(); } catch (_) {}
+            state.peer = null;
+            scheduleMobileReconnect();
+          }
+          return;
+        }
+
+        armGlobalJoinTimeout();
+        connectPlayerToHost();
+      }, 800);
     }
 
     function handleHostMessage(data) {
@@ -2937,17 +3087,18 @@
 
       if (data.type === "joined") {
         state.joinConfirmed = true;
-        state.connectAttemptToken++;
         stopJoinHandshake();
         clearTimeout(state.joinTimeoutId);
         clearTimeout(state.reconnectTimerId);
         state.joinTimeoutId = null;
         state.reconnectTimerId = null;
         state.playerName = data.name;
-        try {
-          sessionStorage.setItem("quizrush-last-room", data.roomCode);
-          sessionStorage.setItem("quizrush-last-name", data.name);
-        } catch (_) {}
+        if (data.playerToken) {
+          state.playerToken = data.playerToken;
+          safeStorageSet("sessionStorage", "quizrush-player-token", data.playerToken);
+        }
+        safeStorageSet("sessionStorage", "quizrush-last-room", data.roomCode);
+        safeStorageSet("sessionStorage", "quizrush-last-name", data.name);
         setStatus(`Na sala ${data.roomCode}`);
         setWaitingConnectionState(
           `Você entrou como ${data.name}!`,
@@ -2960,6 +3111,20 @@
             try { state.hostConnection.send({ type: "ping", at: Date.now() }); } catch (_) {}
           }
         }, 8000);
+      }
+
+      if (data.type === "reconnectedWaiting") {
+        state.score = Number(data.score ?? state.score);
+        state.streak = Number(data.streak ?? state.streak);
+        state.skipsLeft = Number(data.skipsLeft ?? state.skipsLeft);
+        state.allInAvailable = Boolean(data.allInAvailable ?? state.allInAvailable);
+        setStatus("Reconectado");
+        setWaitingConnectionState(
+          "Conexão recuperada!",
+          "Sua resposta e sua pontuação foram preservadas. Aguarde a próxima pergunta.",
+          { loading: false, retry: false }
+        );
+        showScreen("playerWaitingScreen");
       }
 
       if (data.type === "joinError") {
@@ -3776,7 +3941,7 @@
 
         if (game.score > state.flappyBest) {
           state.flappyBest = game.score;
-          localStorage.setItem("quizrush-flappy-best", String(state.flappyBest));
+          safeStorageSet("localStorage", "quizrush-flappy-best", state.flappyBest);
         }
 
         $("flappyBestScore").textContent = state.flappyBest;
